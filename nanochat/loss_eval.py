@@ -68,18 +68,29 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     It is a 1D tensor of shape (vocab_size,), indicating the number of bytes for
     each token id, or 0 if the token is to not be counted (e.g. special tokens).
 
-    For interleaved models, this runs the full interleaved pipeline and returns a dict with:
-    - 'bpb': merged BPB — each position scored by the LAST pass that computed it
-             (the interleaved pipeline's actual output quality)
-    - 'per_pass_bpb': list of BPB, [full, interleaved_1, ..., interleaved_N]; interleaved passes are
-             scored only at their own positions
-    For non-interleaved models, returns just the BPB float (backwards compatible).
+    For feedback models (interleaved or multi-refine), this runs the full multi-pass pipeline
+    and returns a dict with:
+    - 'bpb': the pipeline's actual output quality.
+             Interleaved: merged BPB — passes cover disjoint positions, so each position
+             is scored by the LAST pass that computed it.
+             Multi-refine: every pass covers all positions, so there is nothing to merge;
+             this is just the final pass's BPB (== per_pass_bpb[-1]).
+    - 'per_pass_bpb': list of BPB. Interleaved: [full, interleaved_1, ..., interleaved_N],
+             interleaved passes scored only at their own positions. Multi-refine:
+             [refine_0, ..., refine_N], all scored at all positions.
+    For non-feedback models, returns just the BPB float (backwards compatible).
     """
     device = model.get_device()
     use_interleaved = getattr(model.config, 'use_interleaved', False)
+    use_multi_refine = getattr(model.config, 'use_multi_refine', False)
 
-    if use_interleaved:
-        n_passes = 1 + model.config.interleaved_num_passes
+    if use_interleaved or use_multi_refine:
+        if use_interleaved:
+            n_passes = 1 + model.config.interleaved_num_passes
+            train_fn = model.forward_interleaved_train
+        else:
+            n_passes = 1 + model.config.multi_refine_num_passes
+            train_fn = model.forward_multi_refine_train
         # Track nats/bytes per pass, plus the merged (last-writer-wins) combination
         per_pass_nats = [torch.tensor(0.0, dtype=torch.float32, device=device) for _ in range(n_passes)]
         per_pass_bytes = [torch.tensor(0, dtype=torch.int64, device=device) for _ in range(n_passes)]
@@ -89,16 +100,17 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         batch_iter = iter(batches)
         for _ in range(steps):
             x, y = next(batch_iter)
-            outputs = model.forward_interleaved_train(x, y, loss_reduction='none')
+            outputs = train_fn(x, y, loss_reduction='none')
             per_pass_losses = outputs['per_pass_losses']  # list of [B*T] tensors
             per_pass_masks = outputs['per_pass_masks']    # list of None or [T] bool
             assert len(per_pass_losses) == n_passes
 
-            merged_loss = per_pass_losses[0].clone()  # full pass covers all positions
+            merged_loss = per_pass_losses[0]  # overwritten below, last-writer-wins
             for p, (loss_flat, mask) in enumerate(zip(per_pass_losses, per_pass_masks)):
                 if mask is None:
-                    # full pass: covers all positions
+                    # covers all positions (the full pass, or any multi-refine pass)
                     _accumulate_nats_bytes(loss_flat, y, token_bytes, per_pass_nats[p], per_pass_bytes[p])
+                    merged_loss = loss_flat
                 else:
                     # interleaved pass: score only at its own (core) positions
                     y_pass = y.clone()
@@ -133,10 +145,12 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 @torch.no_grad()
 def evaluate_bpb_sequential(model, batches, steps, token_bytes, mode='recurrent', bucket_size=256):
     """
-    Sequential token-by-token BPB evaluation for interleaved models (true recurrent inference).
+    Sequential token-by-token BPB evaluation for feedback models — interleaved or multi-refine
+    (true recurrent inference; for multi-refine models this is the diagonal limit that
+    multi-refinement training approximates with a growing number of passes).
 
     Args:
-        mode: 'recurrent' = feed h_final from the previous position as feedback (interleaved-pass mode)
+        mode: 'recurrent' = feed h_final from the previous position as feedback
               'full_pass_sanity' = zero feedback throughout (should match the parallel full-pass bpb)
         bucket_size: position bucket size for per-bucket BPB breakdown (default 256)
 

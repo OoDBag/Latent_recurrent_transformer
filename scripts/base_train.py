@@ -51,11 +51,17 @@ parser.add_argument("--no-value-embeds", action="store_true", help="disable valu
 parser.add_argument("--ve-every-layer", action="store_true", help="value embeddings on every layer (default: alternating layers, last layer included)")
 parser.add_argument("--no-x0-residual", action="store_true", help="disable x0 residual (skip connection to input embedding)")
 parser.add_argument("--no-resid-lambdas", action="store_true", help="disable learnable per-layer residual scaling")
-parser.add_argument("--ve-gate-channels", type=int, default=32, help="input channels for value/feedback gate (0 = full n_embd)")
+parser.add_argument("--ve-gate-channels", type=int, default=0, help="input channels for value/feedback gate (0 = full n_embd, the default)")
 # Interleaved training (recurrent feedback: 1 full pass + N interleaved interleaved passes)
 parser.add_argument("--interleaved", action="store_true", help="enable parallel interleaved training")
 parser.add_argument("--interleaved-passes", type=int, default=2, help="number of interleaved passes after the single full pass (interleaved pass i covers positions pos %% N == i)")
 parser.add_argument("--interleaved-kv-refresh", action="store_true", help="between interleaved passes, cheaply refresh the buffered V/K at not-yet-visited positions by re-projecting the latest h_final")
+# Full-sequence multi-refinement training (recurrent feedback: pass 0 with zero feedback + N FULL refinement passes;
+# every position is recomputed each pass, so cost and activation memory scale with 1+N — consider a smaller --device-batch-size)
+parser.add_argument("--multi-refine", action="store_true", help="enable full-sequence multi-refinement training (mutually exclusive with --interleaved)")
+parser.add_argument("--multi-refine-passes", type=int, default=2, help="number of refinement passes after the zero-feedback pass 0 (total forwards per step = 1 + N)")
+parser.add_argument("--multi-refine-detach", action="store_true", help="detach h_final between passes (no gradient flow from later passes into earlier ones)")
+parser.add_argument("--multi-refine-loss-weights", type=str, default="", help="comma-separated per-pass loss weights of length 1+N, e.g. '0.5,1,2' (empty = equal weights)")
 parser.add_argument("--compile-dynamic", action="store_true", help="use dynamic=True for torch.compile (slower per step, no recompilation on shape changes; default: dynamic=False, faster per step but recompiles on first step for each unique shape)")
 parser.add_argument("--compile-interleaved", action="store_true", help="also torch.compile the interleaved-pass forward (forward_interleaved), which otherwise runs eagerly; interleaved positions are deterministic per pass -> static shapes")
 # Training horizon (only one used, in order of precedence)
@@ -79,7 +85,7 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--eval-seq-every", type=int, default=250, help="evaluate sequential (recurrent) bpb every N steps, interleaved models only (-1 = disable)")
+parser.add_argument("--eval-seq-every", type=int, default=250, help="evaluate sequential (recurrent) bpb every N steps, feedback (interleaved/multi-refine) models only (-1 = disable)")
 parser.add_argument("--eval-seq-batch-size", type=int, default=128, help="per-device batch size for sequential bpb eval (larger = faster, limited by KV cache memory)")
 parser.add_argument("--eval-seq-full-pass-sanity", action="store_true", help="also run full_pass_sanity sequential eval (token-by-token with zero feedback; should match the parallel full-pass bpb)")
 parser.add_argument("--core-metric-every", type=int, default=3000, help="evaluate CORE metric every N steps (-1 = disable)")
@@ -90,6 +96,11 @@ parser.add_argument("--no-save", action="store_true", help="skip ALL checkpoint 
 # Output
 parser.add_argument("--model-tag", type=str, default="", help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+assert not (args.interleaved and args.multi_refine), "--interleaved and --multi-refine are mutually exclusive training schedules"
+multi_refine_loss_weights = tuple(float(w) for w in args.multi_refine_loss_weights.split(",")) if args.multi_refine_loss_weights else ()
+if multi_refine_loss_weights:
+    assert args.multi_refine, "--multi-refine-loss-weights requires --multi-refine"
+    assert len(multi_refine_loss_weights) == 1 + args.multi_refine_passes, f"--multi-refine-loss-weights needs 1 + multi_refine_passes = {1 + args.multi_refine_passes} values, got {len(multi_refine_loss_weights)}"
 set_dataset(args.dataset) # select the pretraining dataset before any dataloader is built
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -151,6 +162,9 @@ print0(f"use_resid_lambdas: {not args.no_resid_lambdas}")
 # Interleaved training settings
 if args.interleaved:
     print0(f"use_interleaved: True (interleaved passes={args.interleaved_passes}, kv_refresh={args.interleaved_kv_refresh})")
+# Multi-refinement training settings
+if args.multi_refine:
+    print0(f"use_multi_refine: True (multi-refine passes={args.multi_refine_passes}, detach={args.multi_refine_detach}, loss_weights={multi_refine_loss_weights if multi_refine_loss_weights else 'equal'})")
 
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
@@ -182,7 +196,7 @@ if args.depth != 12:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, use_value_embeds=not args.no_value_embeds, ve_every_layer=args.ve_every_layer, use_x0_residual=not args.no_x0_residual, use_resid_lambdas=not args.no_resid_lambdas, ve_gate_channels=args.ve_gate_channels, use_interleaved=args.interleaved, interleaved_num_passes=args.interleaved_passes, interleaved_kv_refresh=args.interleaved_kv_refresh)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, use_value_embeds=not args.no_value_embeds, ve_every_layer=args.ve_every_layer, use_x0_residual=not args.no_x0_residual, use_resid_lambdas=not args.no_resid_lambdas, ve_gate_channels=args.ve_gate_channels, use_interleaved=args.interleaved, interleaved_num_passes=args.interleaved_passes, interleaved_kv_refresh=args.interleaved_kv_refresh, use_multi_refine=args.multi_refine, multi_refine_num_passes=args.multi_refine_passes, multi_refine_detach=args.multi_refine_detach, multi_refine_loss_weights=multi_refine_loss_weights)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
@@ -322,14 +336,20 @@ while True:
             val_bpb_result = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         # Handle interleaved evaluation (returns dict) vs standard (returns float)
         if isinstance(val_bpb_result, dict):
-            # 'bpb' = merged (each position scored by the last pass that computed it);
-            # 'per_pass_bpb' = [full, interleaved_1, ..., interleaved_N] (interleaved passes scored only
-            # at their own positions)
+            # interleaved: 'bpb' = merged (each position scored by the last pass that computed it),
+            #   'per_pass_bpb' = [full, interleaved_1, ..., interleaved_N] (each scored at its own positions)
+            # multi-refine: every pass covers all positions, so there is nothing to merge —
+            #   'bpb' is simply the final pass, 'per_pass_bpb' = [refine_0, ..., refine_N]
             val_bpb = val_bpb_result['bpb']
             per_pass_bpb = val_bpb_result['per_pass_bpb']
-            pass_labels = ["full"] + [f"interleaved{i}" for i in range(1, len(per_pass_bpb))]
+            if args.multi_refine:
+                pass_labels = [f"refine{i}" for i in range(len(per_pass_bpb))]  # refine0 = zero-feedback pass
+                bpb_kind = "final pass"
+            else:
+                pass_labels = ["full"] + [f"interleaved{i}" for i in range(1, len(per_pass_bpb))]
+                bpb_kind = "merged"
             per_pass_str = " | ".join([f"{lbl}: {bpb:.6f}" for lbl, bpb in zip(pass_labels, per_pass_bpb)])
-            print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} (merged) | {per_pass_str}")
+            print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} ({bpb_kind}) | {per_pass_str}")
         else:
             val_bpb = val_bpb_result
             per_pass_bpb = None
@@ -347,8 +367,8 @@ while True:
                 eval_log_data[f"val/bpb_{lbl}"] = bpb
         model.train()
 
-    # once in a while: evaluate sequential (recurrent) bpb for interleaved models
-    if args.interleaved and args.eval_seq_every > 0 and (last_step or (step > 0 and step % args.eval_seq_every == 0)):
+    # once in a while: evaluate sequential (recurrent) bpb for feedback models
+    if (args.interleaved or args.multi_refine) and args.eval_seq_every > 0 and (last_step or (step > 0 and step % args.eval_seq_every == 0)):
         model.eval()
         seq_eval_steps = args.eval_tokens // (args.eval_seq_batch_size * args.max_seq_len * ddp_world_size)
         # Sanity check: token-by-token with zero feedback (should match the parallel full-pass bpb)
@@ -381,8 +401,8 @@ while True:
     if eval_log_data is not None:
         wandb_run.log(eval_log_data)
 
-    # Print interleaved diagnostics (lambdas + gate values) after all bpb results are printed
-    if args.interleaved and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    # Print feedback diagnostics (lambdas + gate values) after all bpb results are printed
+    if (args.interleaved or args.multi_refine) and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         diag_loader = build_val_loader()
         with autocast_ctx:
@@ -466,6 +486,10 @@ while True:
             if args.interleaved:
                 # Interleaved training: 1 full pass + interleaved passes
                 outputs = orig_model.forward_interleaved_train(x, y, use_compiled_model=model)
+                loss = outputs['loss']
+            elif args.multi_refine:
+                # Multi-refinement training: 1 + N full passes, all through the compiled model
+                outputs = orig_model.forward_multi_refine_train(x, y, use_compiled_model=model)
                 loss = outputs['loss']
             else:
                 # Standard single-pass training: use compiled model

@@ -4,7 +4,7 @@ Unified evaluation script for base models.
 Supports evaluation modes (comma-separated):
   --eval core    : CORE metric (accuracy on ICL tasks)
   --eval bpb     : Bits per byte on train/val splits
-  --eval bpb_seq : Sequential (recurrent) BPB for interleaved models
+  --eval bpb_seq : Sequential (recurrent) BPB for feedback (interleaved/multi-refine) models
   --eval sample  : Generate samples from the model
 
 Default is: --eval core,bpb,sample
@@ -271,10 +271,17 @@ def main():
             with autocast_ctx:
                 bpb = evaluate_bpb(model, loader, steps, token_bytes)
             if isinstance(bpb, dict):
-                # Interleaved model: merged bpb + per-pass breakdown
-                pass_labels = ["full"] + [f"interleaved{i}" for i in range(1, len(bpb['per_pass_bpb']))]
+                # Feedback model: headline bpb + per-pass breakdown. Interleaved passes cover
+                # disjoint positions, so the headline is the merged score; multi-refine passes
+                # all cover every position, so the headline is simply the final pass.
+                if getattr(model.config, 'use_multi_refine', False):
+                    pass_labels = [f"refine{i}" for i in range(len(bpb['per_pass_bpb']))]  # refine0 = zero-feedback pass
+                    bpb_kind = "final pass"
+                else:
+                    pass_labels = ["full"] + [f"interleaved{i}" for i in range(1, len(bpb['per_pass_bpb']))]
+                    bpb_kind = "merged"
                 per_pass_str = " | ".join([f"{lbl}: {b:.6f}" for lbl, b in zip(pass_labels, bpb['per_pass_bpb'])])
-                print0(f"{split_name} bpb: {bpb['bpb']:.6f} (merged) | {per_pass_str}")
+                print0(f"{split_name} bpb: {bpb['bpb']:.6f} ({bpb_kind}) | {per_pass_str}")
                 bpb_results[split_name] = bpb['bpb']
             else:
                 bpb_results[split_name] = bpb
@@ -282,9 +289,9 @@ def main():
 
     # --- Sequential BPB evaluation (recurrent inference) ---
     if 'bpb_seq' in eval_modes:
-        use_interleaved = hasattr(model, 'config') and getattr(model.config, 'use_interleaved', False)
-        if not use_interleaved:
-            print0("\nSkipping bpb_seq: only applicable to interleaved models")
+        use_feedback = hasattr(model, 'config') and (getattr(model.config, 'use_interleaved', False) or getattr(model.config, 'use_multi_refine', False))
+        if not use_feedback:
+            print0("\nSkipping bpb_seq: only applicable to feedback (interleaved/multi-refine) models")
         else:
             print0("\n" + "="*80)
             print0("Sequential BPB Evaluation (recurrent inference)")

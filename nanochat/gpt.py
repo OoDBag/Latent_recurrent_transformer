@@ -59,7 +59,7 @@ class GPTConfig:
     ve_every_layer: bool = False   # Value embeddings on EVERY layer (default: alternating, last layer included)
     use_x0_residual: bool = True   # Skip connection to input embedding
     use_resid_lambdas: bool = True # Learnable per-layer residual scaling
-    ve_gate_channels: int = 32     # Number of input channels for value/feedback gate (0 = full n_embd)
+    ve_gate_channels: int = 0      # Number of input channels for value/feedback gate (0 = full n_embd, the default)
     # ---- Parallel interleaved training (recurrent feedback) ----
     # Fixed recipe, applied at EVERY layer: h_final feedback is injected into the residual
     # stream (gamma), projected to V and K space (per-layer projections), and mixed via a
@@ -68,6 +68,28 @@ class GPTConfig:
     use_interleaved: bool = False       # Enable parallel interleaved training: 1 full pass + interleaved_num_passes interleaved passes
     interleaved_num_passes: int = 2     # Number of interleaved passes after the single full pass
     interleaved_kv_refresh: bool = False  # Between interleaved passes, cheaply refresh the buffered V/K at not-yet-visited positions by re-projecting the latest h_final. Reduces stale-KV gap.
+    # ---- Full-sequence multi-refinement training (recurrent feedback) ----
+    # Same feedback architecture as interleaved training (γ residual injection, V/K
+    # projections, triple gate, init value embeds), but a different training schedule:
+    # every pass is a FULL forward over all positions. Pass 0 runs with zero feedback;
+    # pass k >= 1 feeds shift_right(h_final of pass k-1) back in, so each position is
+    # refined multi_refine_num_passes times per step (diagonal credit: position t at pass k
+    # sees position t-1 at pass k-1). Costs (1 + N) full forwards per step.
+    use_multi_refine: bool = False            # Enable full-sequence multi-refinement training (mutually exclusive with use_interleaved)
+    multi_refine_num_passes: int = 2          # Number of refinement passes after the zero-feedback pass 0
+    multi_refine_detach: bool = False         # Detach h_final between passes (no gradient flow from later passes into earlier ones)
+    multi_refine_loss_weights: tuple = ()     # Per-pass loss weights, length 1 + multi_refine_num_passes (empty = equal weights)
+
+    def __post_init__(self):
+        assert not (self.use_interleaved and self.use_multi_refine), "use_interleaved and use_multi_refine are mutually exclusive training schedules"
+        if self.multi_refine_loss_weights:
+            assert len(self.multi_refine_loss_weights) == 1 + self.multi_refine_num_passes, \
+                f"multi_refine_loss_weights must have length 1 + multi_refine_num_passes = {1 + self.multi_refine_num_passes}, got {len(self.multi_refine_loss_weights)}"
+
+    @property
+    def uses_feedback(self):
+        """The recurrent-feedback architecture is shared by both training schedules."""
+        return self.use_interleaved or self.use_multi_refine
 
 
 def norm(x):
@@ -132,12 +154,12 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = config.ve_gate_channels if config.ve_gate_channels > 0 else config.n_embd
-        # Triple gate (interleaved models, every layer): v = gate_local * v + gate_fb * v_fb + gate_ve * v_ve
-        self.triple_gate = nn.Linear(self.ve_gate_channels, 3 * self.n_kv_head, bias=False) if config.use_interleaved else None
-        # Shared gate for token-indexed value embeddings (non-interleaved models)
+        # Triple gate (feedback models, every layer): v = gate_local * v + gate_fb * v_fb + gate_ve * v_ve
+        self.triple_gate = nn.Linear(self.ve_gate_channels, 3 * self.n_kv_head, bias=False) if config.uses_feedback else None
+        # Shared gate for token-indexed value embeddings (non-feedback models)
         has_ve_gate = has_ve(layer_idx, config.n_layer, config.use_value_embeds, config.ve_every_layer)
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if (
-            has_ve_gate and not config.use_interleaved
+            has_ve_gate and not config.uses_feedback
         ) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, v_fb=None, v_ve=None, k_fb=None, pass_idx=0):
@@ -348,12 +370,12 @@ class GPT(nn.Module):
         if config.use_x0_residual:
             self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Value embeddings: alternating layers, last layer always included.
-        # Not created when use_interleaved (the feedback triple gate replaces them at every layer).
+        # Not created for feedback models (the feedback triple gate replaces them at every layer).
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({} if config.use_interleaved else {str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer, config.use_value_embeds, config.ve_every_layer)})
-        # Recurrent feedback mechanism (interleaved training) — one projection set per layer
-        if config.use_interleaved:
+        self.value_embeds = nn.ModuleDict({} if config.uses_feedback else {str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer, config.use_value_embeds, config.ve_every_layer)})
+        # Recurrent feedback mechanism (interleaved/multi-refine training) — one projection set per layer
+        if config.uses_feedback:
             self.interleaved_projections = nn.ModuleDict({
                 str(i): FeedbackProjection(config) for i in range(config.n_layer)
             })
@@ -417,8 +439,8 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
 
-        # Feedback (interleaved) initialization
-        if self.config.use_interleaved:
+        # Feedback (interleaved/multi-refine) initialization
+        if self.config.uses_feedback:
             # Projections: init like c_v (uniform with same std)
             for proj in self.interleaved_projections.values():
                 torch.nn.init.uniform_(proj.W_v.weight, -s, s)
@@ -447,7 +469,7 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
-            if self.config.use_interleaved:
+            if self.config.uses_feedback:
                 for ve in self.interleaved_init_value_embeds.values():
                     ve.to(dtype=torch.bfloat16)
 
@@ -517,7 +539,7 @@ class GPT(nn.Module):
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         interleaved_scalar_numel = 0
         interleaved_init_embeds_numel = 0
-        if self.config.use_interleaved:
+        if self.config.uses_feedback:
             interleaved_scalar_numel += self.interleaved_lambdas.numel()
             interleaved_init_embeds_numel = sum(p.numel() for p in self.interleaved_init_value_embeds.parameters())
         scalars_numel = (getattr(self, 'resid_lambdas', torch.empty(0)).numel() +
@@ -556,7 +578,7 @@ class GPT(nn.Module):
         interleaved_matrices = 0
         interleaved_scalars = 0
         interleaved_init_embeds = 0
-        if self.config.use_interleaved:
+        if self.config.uses_feedback:
             for proj in self.interleaved_projections.values():
                 interleaved_matrices += proj.W_v.weight.numel()
             for proj in self.interleaved_key_projections.values():
@@ -594,7 +616,7 @@ class GPT(nn.Module):
         interleaved_matrix_params = []
         interleaved_scalar_params = []
         interleaved_init_embed_params = []
-        if self.config.use_interleaved:
+        if self.config.uses_feedback:
             for proj in self.interleaved_projections.values():
                 interleaved_matrix_params.append(proj.W_v.weight)
             for proj in self.interleaved_key_projections.values():
@@ -676,7 +698,7 @@ class GPT(nn.Module):
         x = norm(x)
 
         x0 = x if self.config.use_x0_residual else None
-        use_interleaved = self.config.use_interleaved
+        use_feedback = self.config.uses_feedback
         head_dim = self.config.n_embd // self.config.n_head
         for i, block in enumerate(self.transformer.h):
             # Propagate pass_idx to attention for per-pass gate diagnostics
@@ -686,7 +708,7 @@ class GPT(nn.Module):
                 x = self.resid_lambdas[i] * x
             if self.config.use_x0_residual:
                 x = x + self.x0_lambdas[i] * x0
-            if use_interleaved:
+            if use_feedback:
                 # Hidden feedback injection: add h_final_prev to x before each block
                 if h_final_prev is not None:
                     x = x + self.interleaved_lambdas[i] * h_final_prev
@@ -1024,15 +1046,75 @@ class GPT(nn.Module):
             'h_final': h_final.detach() if h_final is not None else None,
         }
 
+    def forward_multi_refine_train(self, idx, targets, loss_reduction='mean', use_compiled_model=None):
+        """
+        Full-sequence multi-refinement training step: pass 0 is a full forward with zero
+        feedback; each refinement pass k >= 1 is another FULL forward over all positions,
+        fed shift_right(h_final of pass k-1). Each position is therefore recomputed
+        1 + multi_refine_num_passes times per step (unlike interleaved training, which partitions
+        positions across passes). Information travels along the diagonal: position t at
+        pass k sees position t-1 at pass k-1.
+
+        The loss is the (optionally weighted) mean over all passes. Unless
+        config.multi_refine_detach is set, gradients flow through h_final from later passes
+        into earlier ones.
+
+        Args:
+            idx: Input token ids [B, T]
+            targets: Target token ids [B, T]
+            loss_reduction: 'mean' or 'none'
+            use_compiled_model: Optional compiled model used for every pass (all passes
+                                are plain full forwards with static shapes; pass_idx only
+                                feeds dead diagnostics branches during training)
+
+        Returns:
+            dict with:
+              'loss': scalar training loss (weighted mean over passes)
+              'per_pass_losses': list of losses, [refine_0 (zero feedback), refine_1, ..., refine_N]
+              'per_pass_masks': list aligned with per_pass_losses; all None since every
+                                pass covers all positions (matches the interleaved format)
+              'h_final': last pass's feedback hidden states (detached)
+        """
+        assert self.config.use_multi_refine, "forward_multi_refine_train requires use_multi_refine=True"
+        n_multi_refine = self.config.multi_refine_num_passes
+        assert n_multi_refine >= 1, f"multi_refine_num_passes must be >= 1, got {n_multi_refine}"
+        forward_fn = use_compiled_model if use_compiled_model is not None else self
+
+        per_pass_losses = []
+        # Pass 0 feedback is an explicit zeros tensor (not None) so the projection/gate
+        # path always runs — same convention as interleaved training and sequential eval.
+        h_recurrent = self._make_zero_h_final(idx)
+        h_final = None
+        for pass_idx in range(1 + n_multi_refine):
+            if pass_idx > 0:
+                h_prev = h_final.detach() if self.config.multi_refine_detach else h_final
+                h_recurrent = self._shift_right(h_prev)
+            loss, h_final = forward_fn(idx, targets, h_final_prev=h_recurrent,
+                                       loss_reduction=loss_reduction, pass_idx=pass_idx)
+            per_pass_losses.append(loss)
+
+        loss_weights = self.config.multi_refine_loss_weights
+        if loss_weights:
+            total_loss = sum(w * l for w, l in zip(loss_weights, per_pass_losses)) / sum(loss_weights)
+        else:
+            total_loss = sum(per_pass_losses) / len(per_pass_losses)
+
+        return {
+            'loss': total_loss,
+            'per_pass_losses': per_pass_losses,
+            'per_pass_masks': [None] * len(per_pass_losses),  # every pass covers all positions
+            'h_final': h_final.detach() if h_final is not None else None,
+        }
+
     @torch.no_grad()
     def print_interleaved_diagnostics(self, batches=None, n_steps=4):
-        """Print per-layer interleaved diagnostics: λ values and average full-pass gate values.
+        """Print per-layer feedback diagnostics: λ values and average gate values.
         Call at validation time. batches/n_steps are used to compute gate averages."""
-        if not self.config.use_interleaved:
+        if not self.config.uses_feedback:
             return
 
         # --- Print learnable λ values ---
-        print0("[Interleaved Diagnostics] Shared lambdas:")
+        print0("[Feedback Diagnostics] Shared lambdas:")
         for i in range(self.config.n_layer):
             parts = []
             if hasattr(self, 'resid_lambdas'):
@@ -1054,18 +1136,25 @@ class GPT(nn.Module):
             batch_iter = iter(batches)
             for _ in range(n_steps):
                 x, y = next(batch_iter)
-                self.forward_interleaved_train(x, y, loss_reduction='mean')
+                if self.config.use_multi_refine:
+                    self.forward_multi_refine_train(x, y, loss_reduction='mean')
+                else:
+                    self.forward_interleaved_train(x, y, loss_reduction='mean')
 
-            # Print full-pass gate stats and clean up. (Interleaved passes run through
-            # forward_interleaved which doesn't collect gate stats; pass 0 is representative.)
-            print0(f"[Interleaved Diagnostics] Average triple gate values — full pass (over {n_steps} batches):")
-            for i, block in enumerate(self.transformer.h):
-                attn = block.attn
-                if 0 in attn._gate_sums and attn._gate_counts[0] > 0:
-                    avg_gate_fb = attn._gate_sums[0] / attn._gate_counts[0]
-                    avg_gate_local = attn._gate_local_sums[0] / attn._gate_counts[0]
-                    avg_gate_ve = attn._gate_ve_sums[0] / attn._gate_counts[0]
-                    print0(f"  Layer {i:2d}: gate_local={avg_gate_local:.4f}, gate_fb={avg_gate_fb:.4f}, gate_ve={avg_gate_ve:.4f}")
+            # Print per-pass gate stats and clean up. For interleaved models only pass 0
+            # collects stats (interleaved passes run through forward_interleaved, which
+            # doesn't collect); for multi-refine models every pass runs through forward.
+            collected_passes = sorted({p for block in self.transformer.h for p in block.attn._gate_sums})
+            for p in collected_passes:
+                pass_label = f"refine pass {p}" if self.config.use_multi_refine else "full pass"
+                print0(f"[Feedback Diagnostics] Average triple gate values — {pass_label} (over {n_steps} batches):")
+                for i, block in enumerate(self.transformer.h):
+                    attn = block.attn
+                    if p in attn._gate_sums and attn._gate_counts[p] > 0:
+                        avg_gate_fb = attn._gate_sums[p] / attn._gate_counts[p]
+                        avg_gate_local = attn._gate_local_sums[p] / attn._gate_counts[p]
+                        avg_gate_ve = attn._gate_ve_sums[p] / attn._gate_counts[p]
+                        print0(f"  Layer {i:2d}: gate_local={avg_gate_local:.4f}, gate_fb={avg_gate_fb:.4f}, gate_ve={avg_gate_ve:.4f}")
             # Clean up
             for block in self.transformer.h:
                 block.attn._collect_gate_stats = False
